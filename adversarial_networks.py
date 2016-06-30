@@ -9,11 +9,12 @@ from LogisticRegression import *
 import numpy as np
 import matplotlib.pyplot as plt
 from rmsprop import rmsprop
+import scipy.misc
 
 learning_rate = .0001
 momentum = 0.9
-batch_size = 1000
-num_epochs = 250
+batch_size = 500
+num_epochs = 30
 TRAIN_DIR = '/home/sam/Documents/mnist/TrainingImages/'
 TEST_DIR = '/home/sam/Documents/mnist/TestImages/'
 
@@ -46,13 +47,16 @@ def buildAdv():
 	glayer0 = HiddenLayer(rng, input=T.concatenate((xg_category_onehot, xg_seed), axis=1), n_in=20, n_out=100, activation=T.tanh)
 	# second mlp hidden layer
 	glayer1 = HiddenLayer(rng, input=glayer0.output, n_in=100, n_out=500, activation=T.tanh)
-	# third mlp hidden layer
-	glayer2 = HiddenLayer(rng, input=glayer1.output, n_in=500, n_out=28*28, activation=T.tanh)
+	glayer2 = HiddenLayer(rng, input=glayer1.output, n_in=500, n_out=1000, activation=T.tanh)
+	# last mlp hidden layer
+	glayer3 = HiddenLayer(rng, input=glayer2.output, n_in=1000, n_out=28*28, activation=T.tanh)
+
+
 	# the output of the generative network
-	goutput = glayer2.output.reshape((batch_size, 1, 28,28))
+	goutput = glayer3.output.reshape((batch_size, 1, 28,28))
 
 	# we want a discriminative mlp that goes from an image, through a convolutional layer, through a hidden layer, through a logistic regression to decide whether 
-	xd = glayer2.output # input images
+	xd = glayer3.output # input images
 	yd = xg_category # label for the images
 
 	yd_onehot = T.extra_ops.to_one_hot(yd, 10)
@@ -73,10 +77,10 @@ def buildAdv():
 	dcost = dlayer3.negative_log_likelihood(zd)
 
 	# This approach uses the negative log liklihood that the incorrect answer is selected (p_y_given_x is the softmax of the output of the layer)
-	gcost = -T.mean(T.log(1-dlayer3.p_y_given_x)[T.arange(zd.shape[0]), zd]) # using the given for zd
+	gcost = -T.mean(T.log(dlayer3.p_y_given_x)[T.arange(zd.shape[0]), 1-zd]) # using the given for zd
 
 	dparams = dlayer3.params + dlayer2.params + dlayer1.params + dlayer0.params
-	gparams = glayer2.params + glayer1.params + glayer0.params
+	gparams = glayer3.params + glayer2.params + glayer1.params + glayer0.params
 
 	dgrads = T.grad(dcost, dparams)
 	ggrads = T.grad(gcost, gparams)
@@ -114,6 +118,13 @@ def buildAdv():
 																			 yd:T.concatenate((test_categories_shared[index * batch_size//2: (index+1) * batch_size//2], 
 																			 current_generated_categories_shared[index * batch_size//2: (index+1)* batch_size//2])),
 																			 zd:zd_given})
+
+	sample = T.matrix('samples')
+	category = T.ivector('category')
+
+	dfire = theano.function([sample, category], dlayer3.p_y_given_x, givens={xd:sample, yd:category})
+
+
 	# category values and random numbers - input to generative network
 	ginput_categories_shared = theano.shared(np.int32(np.array(range(10)*(batch_size//10))))
 	ginput_rng_shared = theano.shared(rng.uniform(low=-1,high=1, size=[batch_size,10]))
@@ -129,6 +140,15 @@ def buildAdv():
 
 	dbest_loss = 1
 
+	def generate_new_data():
+		ginput_rng_shared.set_value(rng.uniform(low=0,high=1, size=[batch_size,10]))
+		generated_data = np.zeros([NUM_TRAINING_EXAMPLES,1,28,28])
+		generated_categories = np.zeros_like(current_generated_categories_shared.get_value())
+		for i in range(NUM_TRAINING_EXAMPLES//batch_size):
+			generated_data[batch_size * i: batch_size * (i+1)], generated_categories[batch_size * i: batch_size * (i+1)] = gfire()
+		current_generated_data_shared.set_value(generated_data.reshape([NUM_TRAINING_EXAMPLES,28*28]))
+		current_generated_categories_shared.set_value(generated_categories)
+
 	# training loop
 	print("Training...")
 	for epoch in range(1, num_epochs):
@@ -136,8 +156,7 @@ def buildAdv():
 		if epoch % 10 == 0:
 			print "evaluating discriminator..."
 			# fire the generator before validating
-			ginput_rng_shared = theano.shared(rng.uniform(low=0,high=1, size=[batch_size,10]))
-			current_generated_data_shared, current_generated_categories_shared = gfire()
+			generate_new_data()
 			# calculate validation loss
 			dvalidation_loss = [dvalidate_model(i) for i in range(NUM_VALIDATION_EXAMPLES//batch_size)]
 			mean_dvalidation_loss = np.mean(dvalidation_loss)
@@ -148,25 +167,38 @@ def buildAdv():
 			print"generation quality (% of fake labeled real): ", (1-gvalidation_loss) * 100, "%"
 			if epoch % 10 == 0:
 				for i in range(10):
-					plt.imshow(current_generated_data_shared[i * len(current_generated_data_shared)/10 + i][0], cmap=plt.get_cmap('gray'))
-					plt.show()
+					#print "percent certainty that generated image is real: ", dfire(current_generated_data_shared[:batch_size].reshape([batch_size,28*28]),current_generated_categories_shared[:batch_size])[i]
+					plt.imshow(np.reshape(current_generated_data_shared.get_value()[i], [28,28]), cmap=plt.get_cmap('gray'), interpolation='nearest')
+					#plt.show()
+					plt.savefig("output2/epoch" + str(epoch) + "image" + str(current_generated_categories_shared.get_value()[i]) + ".png")
 
 		
 		# fire the generator before training
 		ginput_rng_shared = theano.shared(rng.uniform(low=0,high=1, size=[batch_size,10]))
-		current_generated_data_shared, current_generated_categories_shared = gfire()
+		generate_new_data()
 		dc = 1
 		gc = 1
 		for batch_index in range(NUM_TRAINING_EXAMPLES//batch_size * 2):
-			if gc-dc <.1 :
+			if gc*.1 < dc :
 				dc = dtrain_model(batch_index)
-				if batch_index % (NUM_TRAINING_EXAMPLES//batch_size)  == 0: print "dcost: ", dc
-			if dc-gc < .1 :
+				if batch_index % (NUM_TRAINING_EXAMPLES//batch_size)  == 0: 
+					print "dcost: ", dc
+					test = dfire(np.append(training_data_shared.get_value()[0: batch_size//2],
+																			 current_generated_data_shared.get_value()[0: batch_size//2], axis=0),
+																			np.append(training_categories_shared.get_value()[0: batch_size//2], 
+																			 current_generated_categories_shared.get_value()[0:batch_size//2], axis=0))
+					print "percent certainty that real image is [fake,real]: ", test[0]
+					print "correct answer: ", zd_given.get_value()[0]
+					print "percent certainty that generated image is [fake,real]: ", test[batch_size//2]
+					print "correct answer: ", zd_given.get_value()[batch_size//2]
+			if dc*.1 < gc :
 				ginput_rng_shared = theano.shared(rng.uniform(low=0,high=1, size=[batch_size,10]))
 				gc = gtrain_model()
 				if batch_index % (NUM_TRAINING_EXAMPLES//batch_size) == 0: print "gcost: ", gc
 	
 		
+	plt.show()
 
+	
 
 buildAdv()
